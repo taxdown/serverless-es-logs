@@ -20,6 +20,7 @@ class ServerlessEsLogsPlugin {
   private defaultLambdaFilterPattern: string = '[timestamp=*Z, request_id="*-*", event]';
   private defaultApiGWFilterPattern: string = '[event]';
   private defaultIndexDateSeparator: string = '.';
+  private defaultMergeFunctionPolicies: boolean = false;
 
   constructor(serverless: any, options: { [name: string]: any }) {
     this.serverless = serverless;
@@ -198,6 +199,7 @@ class ServerlessEsLogsPlugin {
     const filterPattern = esLogs.filterPattern || this.defaultLambdaFilterPattern;
     const template = this.serverless.service.provider.compiledCloudFormationTemplate;
     const functions = this.serverless.service.getAllFunctions();
+    const mergeFunctionPolicies = esLogs.mergeFunctionPolicies || this.defaultMergeFunctionPolicies;
 
     // Add cloudwatch subscription for each function except log processer
     functions.forEach((name: string) => {
@@ -208,29 +210,11 @@ class ServerlessEsLogsPlugin {
 
       const normalizedFunctionName = this.provider.naming.getNormalizedFunctionName(name);
       const subscriptionLogicalId = `${normalizedFunctionName}SubscriptionFilter`;
-      const permissionLogicalId = `${normalizedFunctionName}CWPermission`;
       const logGroupLogicalId = `${normalizedFunctionName}LogGroup`;
       const logGroupName = template.Resources[logGroupLogicalId].Properties.LogGroupName;
 
-      // Create permission for subscription filter
-      const permission = new LambdaPermissionBuilder()
-        .withFunctionName({
-          'Fn::GetAtt': [
-            this.logProcesserLogicalId,
-            'Arn',
-          ],
-        })
-        .withPrincipal({
-          'Fn::Sub': 'logs.${AWS::Region}.amazonaws.com',
-        })
-        .withSourceArn({
-          'Fn::GetAtt': [
-            logGroupLogicalId,
-            'Arn',
-          ],
-        })
-        .withDependsOn([ this.logProcesserLogicalId, logGroupLogicalId ])
-        .build();
+      // Create subscription template
+      const subscriptionTemplate = new TemplateBuilder()
 
       // Create subscription filter
       const subscriptionFilter = new SubscriptionFilterBuilder()
@@ -242,17 +226,82 @@ class ServerlessEsLogsPlugin {
         })
         .withFilterPattern(filterPattern)
         .withLogGroupName(logGroupName)
-        .withDependsOn([ this.logProcesserLogicalId, permissionLogicalId ])
-        .build();
+        .withDependsOn([ this.logProcesserLogicalId, logGroupLogicalId ])
 
-      // Create subscription template
-      const subscriptionTemplate = new TemplateBuilder()
-        .withResource(permissionLogicalId, permission)
-        .withResource(subscriptionLogicalId, subscriptionFilter)
-        .build();
+      if (!mergeFunctionPolicies) {
+        // Create permission for subscription filter
+        const permissionLogicalId = `${normalizedFunctionName}CWPermission`;
+        const permission = new LambdaPermissionBuilder()
+          .withFunctionName({
+            'Fn::GetAtt': [
+              this.logProcesserLogicalId,
+              'Arn',
+            ],
+          })
+          .withPrincipal({
+            'Fn::Sub': 'logs.${AWS::Region}.amazonaws.com',
+          })
+          .withSourceArn({
+            'Fn::GetAtt': [
+              logGroupLogicalId,
+              'Arn',
+            ],
+          })
+          .withDependsOn([ this.logProcesserLogicalId, logGroupLogicalId ])
+          .build();
 
-      _.merge(template, subscriptionTemplate);
+        // Replace subscription filter dependencies to include this permission
+        subscriptionFilter.withDependsOn([ this.logProcesserLogicalId, permissionLogicalId ]);
+        subscriptionTemplate.withResource(permissionLogicalId, permission);
+      }
+
+      subscriptionTemplate.withResource(subscriptionLogicalId, subscriptionFilter.build())
+      _.merge(template, subscriptionTemplate.build());
     });
+
+    if (mergeFunctionPolicies) {
+      const logicalId = 'ServerlessEsLogsCWPermission';
+      const permission = new LambdaPermissionBuilder()
+          .withFunctionName({
+            'Fn::GetAtt': [
+              this.logProcesserLogicalId,
+              'Arn',
+            ],
+          })
+          .withPrincipal({
+            'Fn::Sub': 'logs.${AWS::Region}.amazonaws.com',
+          })
+          .withSourceArn({
+            'Fn::Join': [
+              '',
+              [
+                'arn:aws:logs:',
+                {
+                  Ref: 'AWS::Region',
+                },
+                ':',
+                {
+                  Ref: 'AWS::AccountId',
+                },
+                ':log-group:',
+                '/aws/lambda/',
+                this.serverless.service.service,
+                '-',
+                this.serverless.service.provider.stage,
+                '-',
+                '*',
+              ],
+            ],
+          })
+          .withDependsOn([ this.logProcesserLogicalId ])
+          .build();
+
+        const permissionsTemplate = new TemplateBuilder()
+          .withResource(logicalId, permission)
+          .build();
+
+      _.merge(template, permissionsTemplate);
+    }
   }
 
   private configureLogRetention(retentionInDays: number): void {

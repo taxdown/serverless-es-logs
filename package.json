@@ -1,5 +1,5 @@
 {
-  "name": "serverless-es-logs",
+  "name": "@taxdown/serverless-es-logs",
   "version": "3.4.2",
   "license": "MIT",
   "description": "A Serverless plugin to transport logs to ElasticSearch",
